@@ -1,0 +1,769 @@
+---
+title: "Euros 2020"
+author: "Kevin Collins"
+date: "12/10/2019"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(tidyverse)
+library(zoo)
+library(rpart)
+library(rattle)
+```
+
+I) Introduction
+
+Next summer is the 2020 UEFA European Football Championship, a competition that occurs once every 4 years. In this project, I hope to explore the stories told by a dataset containing every international football match recorded since 1872, and in the process develop a model so that we can attempt to predict how the playoffs and then the group stages of the Euro 2020 tournament might turn out.
+
+
+II) The Data
+
+First, our data is listed as each single match with a home team and an away team, but this is a little messy for our interests of looking at the performances of individual teams. Therefore, we're going to duplicate the data set, once for the home teams and once for the away teams, so we have match data for every match for each team.
+
+```{r echo=FALSE}
+
+soccer <- read_csv("results.csv")
+
+soccer2 <- soccer
+
+team_data <- rbind(soccer2 %>% select(date,
+                                      "Team" = home_team,
+                                      "Opponent" = away_team,
+                                      "GF" = home_score,
+                                      "GA" = away_score,
+                                      tournament,
+                                      city,
+                                      country,
+                                      neutral),
+                   soccer2 %>% select(date,
+                                      "Opponent" = home_team,
+                                      "Team" = away_team,
+                                      "GA" = home_score,
+                                      "GF" = away_score,
+                                      tournament,
+                                      city,
+                                      country,
+                                      neutral)) %>%
+  arrange(date)
+
+team_data <- team_data %>% 
+  mutate(result = ifelse(GF > GA,
+                         "Win",
+                         ifelse(GF < GA,
+                                "Loss",
+                                "Draw"))) %>%
+  mutate(points = ifelse(GF > GA,
+                         3,
+                         ifelse(GF < GA,
+                                0,
+                                1))) %>%
+  mutate(Field = ifelse(country == Team,
+                        "Home",
+                        ifelse(neutral == TRUE,
+                               "Neutral",
+                               "Away"))) %>%
+  mutate(opponent.points = ifelse(GF > GA,
+                                           0,
+                                           ifelse(GF < GA,
+                                                  3,
+                                                  1)))
+
+
+
+```
+
+Let's take a look at some historical data for various teams! First let's find what are the historically best teams in terms of total wins and then win percentage.
+
+```{r}
+team_data %>%
+  group_by(Team) %>%
+  count(result) %>%
+  filter(result == "Win") %>%
+  arrange(desc(n)) %>%
+  head(10)
+```
+As we see here, Brazil is the team  with the most international wins ever, with England being the European team with the most wins. Obviously, teams that have played more matches are going to have a higher potential for number of wins, so we'll take a look at win percentages in a moment. 
+
+But first, since we're going to look specifically at the Euro ,we might as well delve into the specifics of the most/least successful teams in each  given competition.
+
+```{r}
+library(shiny)
+
+ui <- fluidPage(
+  selectInput(inputId = "league",
+              label = "Competition",
+              sort(unique(team_data$tournament)),
+              multiple = FALSE,
+              selected  = "UEFA Euro"),
+  selectInput(inputId = "result",
+              label = "Result",
+              unique(team_data$result),
+              selected = "Win"),
+  tableOutput(outputId = "list")
+)
+
+server <- function(input, output, session) {
+  output$list <- renderTable({
+    team_data %>%
+      filter(tournament == input$league) %>%
+      group_by(Team) %>%
+      count(result) %>%
+      filter(result == input$result) %>%
+      arrange(desc(n)) %>%
+      head(10)
+  })
+}
+
+shinyApp(ui, server)
+```
+
+Historically Germany has the most ever wins in the Euro competition, which might be something to keep in mind moving forward when we try to predict whether or not a team will be successful in this iteration of the Euros. Alternatively Denmark  and Russia are tied for having the most losses in the history of the Euros, something to perhaps keep an eye out for as well.
+
+Previously, I mentioned looking at win percentages rather than just number of wins, and we'll do so now! First, a look at the teams with the greatest win percentages overall. (Note: We'll exclude anyone who has played less than 100 games since it's not a large enough sample size.)
+
+```{r}
+    team_data %>%
+      group_by(Team) %>%
+      count(result) %>%
+      mutate(`Win Percentage` = n/sum(n)) %>%
+      mutate(`Games Played` =sum(n)) %>%
+      filter(result == "Win") %>%
+      filter(`Games Played` >  100) %>%
+      arrange(desc(`Win Percentage`)) %>%
+      head(10) %>%
+      .[,c(1,4,5)]
+```
+
+Brazil pretty comfortably tops the list for both number of wins and percentage of wins, perhaps making an argument for being the historically best team. Interestingly, England drops to third place among European teams, although it is first in number of wins.
+
+As we did earlier, let's look at individual competitions. Some of them have played very few matches in the history of the competition, so we will remove the filter on number of matches played.
+
+```{r}
+library(shiny)
+
+ui <- fluidPage(
+  selectInput(inputId = "league",
+              label = "Competition",
+              sort(unique(team_data$tournament)),
+              multiple = FALSE,
+              selected  = "UEFA Euro"),
+  tableOutput(outputId = "list")
+)
+
+server <- function(input, output, session) {
+  output$list <- renderTable({
+    team_data %>%
+      filter(tournament == input$league) %>%
+      group_by(Team) %>%
+      count(result) %>%
+      mutate(`Win Percentage` = n/sum(n)) %>%
+      mutate(`Games Played` =sum(n)) %>%
+      filter(result == "Win") %>%
+      arrange(desc(`Win Percentage`)) %>%
+      head(10) %>%
+      .[,c(1,4,5)]
+  })
+}
+
+shinyApp(ui, server)
+```
+
+On our top 10 list here only Wales sticks out as having a small sample size. Beyond them, we see Germany coming in second, which is unsurprising considering their considerable number of wins historically. 
+
+III) Methodology
+
+Now that we've seen how good the best teams really are, let's now take a dive into what factors might be contributing to such strong performances. 
+
+Firstly, I had always heard the phrase "home field advantage", but wondered if this truly had any significant impact on match outcomes. Let's look at the outcomes when a match is played on home turf rather than neutral ground.
+
+```{r}
+team_data %>%
+  filter(Field == "Home") %>%
+  ggplot(aes(x = result)) +
+  geom_bar(fill = "goldenrod") +
+  theme_classic()
+```
+
+This graph certainly demonstrates a serious favorability to the home team when matches are not played on a neutral ground. Seeing as this Euro championship will take place across several host countries, multiple teams will have homefield advantages throughout the tournament. Therefore, we will take field of play into consideration when building a predictive model. 
+
+Unfortunately, as we progress further it looks like our data doesn't have much else to offer at the moment. Thus, we're going to extrapolate some new information from the given data set. First, we'd like to identify some possible new variables based on past performance. However, we can't look at total historical performance as a predictor variable, so instead we're going to take some rolling means. By this I mean that we are going to mutate three new variables: Form, Off, and Def.
+
+Form = The average points won in the 10 previous games
+
+Off = The average number of goals scored in the 10 previous games
+
+Def = The average number of goals conceded in the 10 previous games
+
+We will also mutate identical variables but for the opponent that the team is facing (and then a difference variable for each to make modeling simpler), so we take into account not only the team's strength, but the strength of the team they are playing as well.
+
+```{r echo=TRUE}
+team_data2 <- team_data
+
+team_data2 <- team_data2 %>%
+  group_by(Team) %>%
+  mutate(Form = rollmean(lag(points,1), 
+                         10, 
+                         fill = NA,
+                         align = "right")) %>%
+  mutate(Off = rollmean(lag(GF,1), 
+                                 10, 
+                                 fill = NA,
+                                 align = "right")) %>%
+  mutate(Def = rollmean(lag(GA,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  ungroup() %>%
+  group_by(Opponent) %>%
+  mutate(Opp.Form = rollmean(lag(opponent.points,1), 
+                             10, 
+                             fill = NA,
+                             align = "right")) %>%
+  mutate(Opp.Off = rollmean(lag(GA,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  mutate(Opp.Def = rollmean(lag(GF,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  ungroup() %>%
+  mutate(Form.Diff = Form - Opp.Form) %>%
+  mutate(Off.Diff = Off - Opp.Off) %>%
+  mutate(Def.Diff = Def - Opp.Def)
+```
+
+Now that these new variables have been created, let's take a look at a few newly developed statistics.
+
+In the following interactive graphs, the reader can explore the form, off, and def stats for any given team over their recorded history.
+```{r}
+library(shiny)
+
+ui <- fluidPage(
+  selectInput(inputId = "team",
+              label = "Choose a Nation",
+              sort(unique(team_data$Team)),
+              selected  = "France"),
+  plotOutput(outputId = "form"),
+  plotOutput(outputId = "off"),
+  plotOutput(outputId = "def")
+)
+
+server <- function(input, output, session) {
+  output$form <- renderPlot({
+    team_data2 %>%
+      filter(Team == input$team) %>%
+      ggplot(aes(x = date,
+                 y = Form)) +
+      geom_line(color = "cyan") +
+      geom_line(y = 1) +
+      theme_classic() +
+      ggtitle(input$team)
+  })
+    
+  output$off <- renderPlot({
+    team_data2 %>%
+      filter(Team == input$team) %>%
+      ggplot(aes(x = date,
+                 y = Off)) +
+      geom_line(color = "cyan") +
+      geom_line(y = 1) +
+      theme_classic() +
+      ggtitle(input$team)
+  })
+  
+  output$def <- renderPlot({
+    team_data2 %>%
+      filter(Team == input$team) %>%
+      ggplot(aes(x = date,
+                 y = Def)) +
+      geom_line(color = "cyan") +
+      geom_line(y = 1) +
+      theme_classic() +
+      ggtitle(input$team)
+  })
+}
+
+shinyApp(ui, server)
+```
+
+After having looked at some historical facts about our mutated variables, we're going to look at some regression models to determine if they might be good predictor variables for our upcoming model. (In these models we consider the difference between the Team and the Opponent's form/off/diff.) 
+
+```{r}
+form.model <- lm(points ~ Form.Diff,
+                 data = team_data2)
+summary(form.model)
+
+off.model <- lm(points ~ Off.Diff,
+                 data = team_data2)
+summary(off.model)
+
+def.model <- lm(points ~ Def.Diff,
+                 data = team_data2)
+summary(def.model)
+
+field.model <- lm(points ~ Field,
+                  data = team_data2)
+summary(field.model)
+```
+
+Each of these variables clearly has a low enough p value, that we should consider them to be possible predictor variables. Similarly, the form variables of the opposition will have a similar level of impact as predictor variables.
+
+IV) The Model
+
+Now that we've done a bit of digging and mutating, let's finally move onto the model! I'll be employing a simple decision tree that takes into account the differences in all the form variables between each team, as well as where the match is being played.
+
+```{r}
+fit <- rpart(result ~ Form.Diff + Off.Diff + Def.Diff + Field,
+             data  = team_data2,
+             method = "class")
+
+fancyRpartPlot(fit)
+```
+
+Although it's certainly not the best modeling practice to apply this singular decision tree to the tournament and see who comes out the other end, I'm not particularly experienced in modeling, so we'll just do this to see what outcome we reach. 
+
+First off, let's look at the playoffs to see which low-seeded teams make it into the final tournament.
+
+```{r}
+playoff_semis <- data.frame(Team = c("Iceland",
+                                     "Bulgaria",
+                                     "Bosnia and Herzegovina",
+                                     "Slovakia",
+                                     "Scotland",
+                                     "Norway",
+                                     "Georgia",
+                                     "North Macedonia"),
+                            Opponent = c("Romania",
+                                         "Hungary",
+                                         "Northern Ireland",
+                                         "Republic of Ireland",
+                                         "Israel",
+                                         "Serbia",
+                                         "Belarus",
+                                         "Kosovo"))
+
+playoff_semis <- playoff_semis %>%
+  mutate(GF =  NA) %>%
+  mutate(GA = NA) %>%
+  mutate(date = NA) %>%
+  mutate(tournament = "UEFA Euro") %>%
+  mutate(city = NA) %>%
+  mutate(country = NA) %>%
+  mutate(neutral = FALSE) %>%
+  mutate(result = NA) %>%
+  mutate(points = NA) %>%
+  mutate(opponent.points = NA) %>%
+  mutate(Field = c("Home",
+                   "Home",
+                   "Home",
+                   "Home",
+                   "Home",
+                   "Home",
+                   "Home",
+                   "Home"))
+
+
+playoff_model <- rbind(team_data ,
+                       playoff_semis) %>%
+  group_by(Team) %>%
+  mutate(Form = rollmean(lag(points,1), 
+                         10, 
+                         fill = NA,
+                         align = "right")) %>%
+  mutate(Off = rollmean(lag(GF,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  mutate(Def = rollmean(lag(GA,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  ungroup() %>%
+  group_by(Opponent) %>%
+  mutate(Opp.Form = rollmean(lag(opponent.points,1), 
+                             10, 
+                             fill = NA,
+                             align = "right")) %>%
+  mutate(Opp.Off = rollmean(lag(GA,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  mutate(Opp.Def = rollmean(lag(GF,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  ungroup() %>%   mutate(Form.Diff = Form - Opp.Form) %>%
+  mutate(Off.Diff = Off - Opp.Off) %>%
+  mutate(Def.Diff = Def - Opp.Def) %>%
+  .[83081:83088,]
+
+playoff_prediction <- predict(fit, playoff_model, type = "class")
+playoff_model$result <- playoff_prediction
+
+playoff_model %>%
+  select(Team, Opponent, result)
+```
+
+Here we have every home team winning their playoff semifinal. We move on to the finals of the playoffs where 8 teams compete for four spots.
+
+```{r}
+playoff_finals <- data.frame(Team = c(playoff_model$Team[2],
+                               playoff_model$Team[3],
+                               playoff_model$Team[5],
+                               playoff_model$Team[7]),
+                             Opponent = c(playoff_model$Team[1],
+                               playoff_model$Team[4],
+                               playoff_model$Team[6],
+                               playoff_model$Team[8]))
+
+playoff_finals <- playoff_finals %>%
+  mutate(GF =  NA) %>%
+  mutate(GA = NA) %>%
+  mutate(date = NA) %>%
+  mutate(tournament = "UEFA Euro") %>%
+  mutate(city = NA) %>%
+  mutate(country = NA) %>%
+  mutate(neutral = FALSE) %>%
+  mutate(result = NA) %>%
+  mutate(points = NA) %>%
+  mutate(opponent.points = NA) %>%
+  mutate(Field = c("Home",
+                   "Home",
+                   "Away",
+                   "Home"))
+
+playoff_finals_model <- rbind(team_data ,
+                       playoff_finals) %>%
+  group_by(Team) %>%
+  mutate(Form = rollmean(lag(points,1), 
+                         10, 
+                         fill = NA,
+                         align = "right")) %>%
+  mutate(Off = rollmean(lag(GF,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  mutate(Def = rollmean(lag(GA,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  ungroup() %>%
+  group_by(Opponent) %>%
+  mutate(Opp.Form = rollmean(lag(opponent.points,1), 
+                             10, 
+                             fill = NA,
+                             align = "right")) %>%
+  mutate(Opp.Off = rollmean(lag(GA,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  mutate(Opp.Def = rollmean(lag(GF,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  ungroup() %>%   mutate(Form.Diff = Form - Opp.Form) %>%
+  mutate(Off.Diff = Off - Opp.Off) %>%
+  mutate(Def.Diff = Def - Opp.Def) %>%
+  .[83081:83084,]
+
+playoff_prediction <- predict(fit, playoff_finals_model, type = "class")
+playoff_finals_model$result <- playoff_prediction
+
+playoff_finals_model %>%
+  select(Team, Opponent, result)
+```
+
+Finally, we have our four advancing teams: Iceland, Bosnia and Herzegovina, Norway, and Georgia!
+
+Let's take a look at the groups in the finals of the Euro competition.
+
+```{r}
+euro_groups <- data.frame(A = c("Turkey",
+                                "Italy",
+                                "Wales",
+                                "Switzerland"),
+                          B = c("Denmark",
+                                "Finland",
+                                "Belgium",
+                                "Russia"),
+                          C = c("Netherlands",
+                                "Ukraine",
+                                "Austria",
+                                "Iceland"),
+                          D = c("England",
+                                "Croatia",
+                                "Norway",
+                                "Czech Republic"),
+                          E = c("Spain",
+                                "Sweden",
+                                "Poland",
+                                "Bosnia and Herzegovina"),
+                          F = c("Georgia",
+                                "Portugal",
+                                "France",
+                                "Germany"))
+
+```
+
+```{r}
+library(shiny)
+
+ui <- fluidPage(
+  selectInput(inputId = "group",
+              label = "Group",
+              choices = c("A", "B", "C", "D", "E", "F")),
+  tableOutput(outputId = "table")
+)
+
+server <- function(input, output, session) {
+  output$table <- renderTable({
+    euro_groups %>%
+      select(input$group)
+  })
+}
+
+shinyApp(ui, server)
+```
+
+After taking a perusal of what we have ahead of ourselves, let's apply the model and see what comes out the other side. (Note that Group F seems particularly frightening this year.)
+
+```{r}
+#Gameweek 1
+
+matches1 <- data.frame(Team = c(), Opponent = c())
+for(i in 1:6){
+  matches1 <- rbind(matches1,
+                    data.frame(Team = euro_groups[1:2, i],
+                            Opponent = euro_groups[3:4, i]))
+}
+
+matches1 <- matches1 %>%
+  mutate(GF =  NA) %>%
+  mutate(GA = NA) %>%
+  mutate(date = NA) %>%
+  mutate(tournament = "UEFA Euro") %>%
+  mutate(city = NA) %>%
+  mutate(country = NA) %>%
+  mutate(neutral = FALSE) %>%
+  mutate(result = NA) %>%
+  mutate(points = NA) %>%
+  mutate(opponent.points = NA) %>%
+  mutate(Field = "Neutral")
+
+group_model1 <- rbind(team_data ,
+                     matches1) %>%
+  group_by(Team) %>%
+  mutate(Form = rollmean(lag(points,1), 
+                         10, 
+                         fill = NA,
+                         align = "right")) %>%
+  mutate(Off = rollmean(lag(GF,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  mutate(Def = rollmean(lag(GA,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  ungroup() %>%
+  group_by(Opponent) %>%
+  mutate(Opp.Form = rollmean(lag(opponent.points,1), 
+                             10, 
+                             fill = NA,
+                             align = "right")) %>%
+  mutate(Opp.Off = rollmean(lag(GA,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  mutate(Opp.Def = rollmean(lag(GF,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  ungroup() %>%   mutate(Form.Diff = Form - Opp.Form) %>%
+  mutate(Off.Diff = Off - Opp.Off) %>%
+  mutate(Def.Diff = Def - Opp.Def) %>%
+  .[83081:83092,]
+
+group_prediction <- predict(fit, group_model1, type = "class")
+group_model1$result <- group_prediction
+
+#Gameweek 2
+
+matches2 <- data.frame(Team = c(), Opponent = c())
+for(i in 1:6){
+  matches2 <- rbind(matches2,
+                    data.frame(Team = euro_groups[c(1,3), i],
+                            Opponent = euro_groups[c(2,4), i]))
+}
+
+matches2 <- matches2 %>%
+  mutate(GF =  NA) %>%
+  mutate(GA = NA) %>%
+  mutate(date = NA) %>%
+  mutate(tournament = "UEFA Euro") %>%
+  mutate(city = NA) %>%
+  mutate(country = NA) %>%
+  mutate(neutral = FALSE) %>%
+  mutate(result = NA) %>%
+  mutate(points = NA) %>%
+  mutate(opponent.points = NA) %>%
+  mutate(Field = "Neutral")
+
+group_model2 <- rbind(team_data ,
+                     matches2) %>%
+  group_by(Team) %>%
+  mutate(Form = rollmean(lag(points,1), 
+                         10, 
+                         fill = NA,
+                         align = "right")) %>%
+  mutate(Off = rollmean(lag(GF,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  mutate(Def = rollmean(lag(GA,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  ungroup() %>%
+  group_by(Opponent) %>%
+  mutate(Opp.Form = rollmean(lag(opponent.points,1), 
+                             10, 
+                             fill = NA,
+                             align = "right")) %>%
+  mutate(Opp.Off = rollmean(lag(GA,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  mutate(Opp.Def = rollmean(lag(GF,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  ungroup() %>%   mutate(Form.Diff = Form - Opp.Form) %>%
+  mutate(Off.Diff = Off - Opp.Off) %>%
+  mutate(Def.Diff = Def - Opp.Def) %>%
+  .[83081:83092,]
+
+group_prediction <- predict(fit, group_model2, type = "class")
+group_model2$result <- group_prediction
+
+#Gameweek 3
+
+matches3 <- data.frame(Team = c(), Opponent = c())
+for(i in 1:6){
+  matches3 <- rbind(matches3,
+                    data.frame(Team = euro_groups[c(1,4), i],
+                            Opponent = euro_groups[c(2,3), i]))
+}
+
+matches3 <- matches3 %>%
+  mutate(GF =  NA) %>%
+  mutate(GA = NA) %>%
+  mutate(date = NA) %>%
+  mutate(tournament = "UEFA Euro") %>%
+  mutate(city = NA) %>%
+  mutate(country = NA) %>%
+  mutate(neutral = FALSE) %>%
+  mutate(result = NA) %>%
+  mutate(points = NA) %>%
+  mutate(opponent.points = NA) %>%
+  mutate(Field = "Neutral")
+
+group_model3 <- rbind(team_data ,
+                     matches3) %>%
+  group_by(Team) %>%
+  mutate(Form = rollmean(lag(points,1), 
+                         10, 
+                         fill = NA,
+                         align = "right")) %>%
+  mutate(Off = rollmean(lag(GF,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  mutate(Def = rollmean(lag(GA,1), 
+                        10, 
+                        fill = NA,
+                        align = "right")) %>%
+  ungroup() %>%
+  group_by(Opponent) %>%
+  mutate(Opp.Form = rollmean(lag(opponent.points,1), 
+                             10, 
+                             fill = NA,
+                             align = "right")) %>%
+  mutate(Opp.Off = rollmean(lag(GA,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  mutate(Opp.Def = rollmean(lag(GF,1), 
+                            10, 
+                            fill = NA,
+                            align = "right")) %>%
+  ungroup() %>%   mutate(Form.Diff = Form - Opp.Form) %>%
+  mutate(Off.Diff = Off - Opp.Off) %>%
+  mutate(Def.Diff = Def - Opp.Def) %>%
+  .[83081:83092,]
+
+group_prediction <- predict(fit, group_model3, type = "class")
+group_model3$result <- group_prediction
+
+group_matches <- rbind(group_model1,
+      group_model2,
+      group_model3) %>%
+  select(Team, Opponent, result) %>%
+  mutate(points = ifelse(result == "Win",
+                         3,
+                         0)) %>%
+  mutate(opponent.points = 3 - points)
+
+group_results <- rbind(group_matches %>%
+        select(Team, points),
+      group_matches %>%
+        select("Team" = Opponent,
+               "points" = opponent.points)) %>%
+  group_by(Team) %>%
+  summarize(Points = sum(points)) %>% 
+  left_join(euro_groups %>%
+              gather(key = "Group",
+                     value = "Team"),
+            by = "Team")
+
+```
+
+I've applied the model, and if you search through each group you can see the standings of each. Unfortunately for us, the buck stops here as some tiebreakers that will be considered to determine advancement were not predicted by our model, but nevertheless we can see some outcomes!
+
+```{r}
+library(shiny)
+
+ui <- fluidPage(
+  selectInput(inputId = "group",
+              label = "Group",
+              choices = c("A", "B", "C", "D", "E", "F")),
+  tableOutput(outputId = "table")
+)
+
+server <- function(input, output, session) {
+  output$table <- renderTable({
+    group_results %>%
+      filter(Group == input$group) %>%
+      arrange(desc(Points)) %>%
+      select(Team, Points)
+  })
+}
+
+shinyApp(ui, server)
+```
+
+Looking at the particularly frightening Group F, we actually see that our model predicted that Germany, who has historically had the greatest success, won a total of zero points in the group stage! This might not be out of the question considering their poor performance in the World Cup two years ago, but most people would expect them to at least pull off one win.
+
+V) Closing Remarks
+
+Firstly, through this experiment, some things became distinctly clear about the flaws of this model. For one, in the early stages victories almost always went to home teams, which is perhaps due to the fact that higher-seeded teams hosted the matches, but also perhaps due to an unreasonable weight given to home-field advantage. Also, the model itself only allows for two possible outcomes: Win or Loss, which is of course flawed due to the fact that Draws happen quite frequently in the sport. 
+
+I believe I could address some of these issues with a greater exposure to modeling techniques, and also a larger time-frame that would allow for the prediction of other variables such as goals scored/conceded. 
+
+Beyond all that, it was interesting to explore historical soccer data to get a wholistic picture of who are some of the most successful (or least successful) teams in history. Furthermore, it was interesting to see that even from seemingly few variables, it is still possible to extrapolate values that may function as strong predictors. 
+
+Only time will tell how well this model stands up. Tune in next summer!
